@@ -1,8 +1,9 @@
 import { AlertRule } from '@/types'
+export { truncateId as formatId } from '@/lib/stellar'
 
 /**
  * Shared formatting helpers for dates used across the app.
- * For ID truncation use truncateId() from @/lib/stellar.
+ * `formatId` (re-exported from @/lib/stellar) truncates an ID for display.
  */
 
 /** Formats a Unix ms timestamp as a locale date string (e.g. "5/29/2026"). */
