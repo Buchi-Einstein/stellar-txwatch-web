@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useMemo } from 'react'
 import { useRouter } from 'next/navigation'
 import { WatchedContract, AlertPayload, AlertRule } from '@/types'
 import { getContract, deleteContract, getAlerts, saveContract } from '@/lib/storage'
@@ -25,12 +25,15 @@ export default function ContractDetailPage({ params }: { params: { id: string } 
   const [showEditRules, setShowEditRules] = useState(false)
   const [editedRules, setEditedRules] = useState<AlertRule[]>([])
   const [rulesError, setRulesError] = useState<string | null>(null)
-  const [showUnsavedWarning, setShowUnsavedWarning] = useState(false)
-  
+const [showUnsavedWarning, setShowUnsavedWarning] = useState(false)
+  const [searchHash, setSearchHash] = useState('')
+   
   // Metadata editing state
   const [showEditMetadata, setShowEditMetadata] = useState(false)
   const [editedLabel, setEditedLabel] = useState('')
   const [editedWebhookUrl, setEditedWebhookUrl] = useState('')
+  const [editedWebhookSecret, setEditedWebhookSecret] = useState('')
+  const [showWebhookSecret, setShowWebhookSecret] = useState(false)
   const [metadataError, setMetadataError] = useState<string | null>(null)
 
   useEffect(() => {
@@ -44,6 +47,12 @@ export default function ContractDetailPage({ params }: { params: { id: string } 
     setAlerts(getAlerts(params.id))
     setMounted(true)
   }, [params.id, router])
+
+  const filteredAlerts = useMemo(() => {
+    if (!searchHash) return alerts
+    const searchLower = searchHash.toLowerCase()
+    return alerts.filter(a => a.transaction_hash.toLowerCase().includes(searchLower))
+  }, [alerts, searchHash])
 
   function handleDelete() {
     deleteContract(params.id)
@@ -87,6 +96,8 @@ export default function ContractDetailPage({ params }: { params: { id: string } 
   function openEditMetadata() {
     setEditedLabel(contract!.label)
     setEditedWebhookUrl(contract!.webhook_url)
+    setEditedWebhookSecret(contract!.webhook_secret || '')
+    setShowWebhookSecret(false)
     setMetadataError(null)
     setShowEditMetadata(true)
     trackEvent('metadata_edit_opened', { contractId: params.id })
@@ -121,7 +132,8 @@ export default function ContractDetailPage({ params }: { params: { id: string } 
     const updated = { 
       ...contract!, 
       label: trimmedLabel,
-      webhook_url: trimmedWebhookUrl
+      webhook_url: trimmedWebhookUrl,
+      webhook_secret: editedWebhookSecret.trim() || undefined,
     }
     saveContract(updated)
     setContract(updated)
@@ -130,7 +142,7 @@ export default function ContractDetailPage({ params }: { params: { id: string } 
   }
 
   function hasMetadataChanges(): boolean {
-    return editedLabel !== contract?.label || editedWebhookUrl !== contract?.webhook_url
+    return editedLabel !== contract?.label || editedWebhookUrl !== contract?.webhook_url || editedWebhookSecret !== (contract?.webhook_secret || '')
   }
 
   function handleCancelMetadataEdit() {
@@ -233,6 +245,15 @@ export default function ContractDetailPage({ params }: { params: { id: string } 
             {contract.webhook_url}
           </a>
         </div>
+        {contract.webhook_secret && (
+          <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-4">
+            <div className="flex items-center justify-between mb-1">
+              <p className="text-xs text-zinc-500">Webhook Secret</p>
+              <CopyButton text={contract.webhook_secret} />
+            </div>
+            <p className="text-sm text-zinc-300 font-mono">••••••••{contract.webhook_secret.slice(-4)}</p>
+          </div>
+        )}
         <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-4">
           <p className="text-xs text-zinc-500 mb-1">Registered</p>
           <p className="text-sm text-zinc-300">{formatDate(contract.created_at)}</p>
@@ -272,9 +293,32 @@ export default function ContractDetailPage({ params }: { params: { id: string } 
 
       {/* Alert History */}
       <div>
-        <h2 className="text-lg font-semibold text-zinc-100 mb-3">Alert History</h2>
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-3">
+          <h2 className="text-lg font-semibold text-zinc-100">Alert History</h2>
+          <div className="relative w-full sm:w-64">
+            <label htmlFor="hash-search" className="sr-only">Search by transaction hash</label>
+            <input
+              id="hash-search"
+              type="text"
+              placeholder="Search by transaction hash..."
+              value={searchHash}
+              onChange={(e) => setSearchHash(e.target.value)}
+              className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-lg text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+            />
+            {searchHash && (
+              <button
+                onClick={() => setSearchHash('')}
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-zinc-500 hover:text-zinc-300"
+              >
+                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            )}
+          </div>
+        </div>
         <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-6">
-          <WebhookLog alerts={alerts} network={contract.network} />
+          <WebhookLog alerts={filteredAlerts} network={contract.network} />
         </div>
       </div>
 
@@ -319,6 +363,33 @@ export default function ContractDetailPage({ params }: { params: { id: string } 
                 />
                 <p className="text-xs text-zinc-500 mt-1">
                   Must be a valid HTTP or HTTPS URL
+                </p>
+              </div>
+
+              {/* Webhook Secret field */}
+              <div>
+                <label htmlFor="edit-webhook-secret" className="block text-sm font-medium text-zinc-300 mb-2">
+                  Webhook Secret (Optional)
+                </label>
+                <div className="flex gap-2">
+                  <input
+                    id="edit-webhook-secret"
+                    type={showWebhookSecret ? 'text' : 'password'}
+                    value={editedWebhookSecret}
+                    onChange={(e) => setEditedWebhookSecret(e.target.value)}
+                    placeholder="Your HMAC secret key"
+                    className="flex-1 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-lg text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowWebhookSecret(!showWebhookSecret)}
+                    className="px-3 py-2 rounded-lg border border-zinc-700 hover:border-zinc-500 text-sm text-zinc-300 hover:text-zinc-100 transition-colors whitespace-nowrap"
+                  >
+                    {showWebhookSecret ? 'Hide' : 'Show'}
+                  </button>
+                </div>
+                <p className="text-xs text-zinc-500 mt-1">
+                  Used to sign payloads with HMAC-SHA256. Receivers can verify the X-TxWatch-Signature header.
                 </p>
               </div>
             </div>

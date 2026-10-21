@@ -1,6 +1,6 @@
 'use client'
 
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { AlertRule, AlertRuleType } from '@/types'
 import { formatRuleSummary } from '@/lib/format'
 import AlertRuleBadge from './AlertRuleBadge'
@@ -21,6 +21,29 @@ const RULE_EXAMPLES: Record<AlertRuleType, string> = {
   'TransactionFailed': 'Alert on failed transactions',
 }
 
+const TEMPLATE_STORAGE_KEY = 'txwatch_rule_templates'
+
+interface RuleTemplate {
+  id: string
+  name: string
+  rules: AlertRule[]
+  created_at: number
+}
+
+function loadTemplates(): RuleTemplate[] {
+  if (typeof window === 'undefined') return []
+  try {
+    return JSON.parse(window.localStorage.getItem(TEMPLATE_STORAGE_KEY) ?? '[]')
+  } catch {
+    return []
+  }
+}
+
+function saveTemplates(templates: RuleTemplate[]) {
+  if (typeof window === 'undefined') return
+  window.localStorage.setItem(TEMPLATE_STORAGE_KEY, JSON.stringify(templates))
+}
+
 interface RuleBuilderProps {
   rules: AlertRule[]
   onChange: (rules: AlertRule[]) => void
@@ -36,6 +59,14 @@ export default function RuleBuilder({ rules, onChange, onRulesChanged }: RuleBui
   const [editingIndex, setEditingIndex] = useState<number | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [warning, setWarning] = useState<string | null>(null)
+  const [templates, setTemplates] = useState<RuleTemplate[]>([])
+  const [showTemplateModal, setShowTemplateModal] = useState(false)
+  const [templateName, setTemplateName] = useState('')
+  const [selectedTemplateId, setSelectedTemplateId] = useState<string | null>(null)
+
+  useEffect(() => {
+    setTemplates(loadTemplates())
+  }, [])
 
   function updateDraft(patch: Partial<AlertRule>) {
     setDraft((prev) => ({ ...prev, ...patch }))
@@ -135,6 +166,51 @@ export default function RuleBuilder({ rules, onChange, onRulesChanged }: RuleBui
     onRulesChanged?.(updated, 'remove')
   }
 
+  function saveAsTemplate() {
+    if (!templateName.trim()) {
+      setError('Enter a template name')
+      return
+    }
+    if (rules.length === 0) {
+      setError('No rules to save as template')
+      return
+    }
+    const templates = loadTemplates()
+    const newTemplate: RuleTemplate = {
+      id: `template_${Date.now()}`,
+      name: templateName.trim(),
+      rules: [...rules],
+      created_at: Date.now(),
+    }
+    saveTemplates([...templates, newTemplate])
+    setTemplates([...templates, newTemplate])
+    setTemplateName('')
+    setShowTemplateModal(false)
+  }
+
+  function loadTemplate(templateId: string) {
+    const template = templates.find(t => t.id === templateId)
+    if (template) {
+      onChange([...template.rules])
+      onRulesChanged?.([...template.rules], 'add')
+      setSelectedTemplateId(null)
+    }
+  }
+
+  function deleteTemplate(templateId: string) {
+    const templates = loadTemplates().filter(t => t.id !== templateId)
+    saveTemplates(templates)
+    setTemplates(templates)
+  }
+
+  function openSaveTemplateModal() {
+    if (rules.length === 0) {
+      setError('No rules to save as template')
+      return
+    }
+    setShowTemplateModal(true)
+  }
+
   return (
     <div className="space-y-4">
       <div className="bg-zinc-800/50 border border-zinc-700 rounded-lg p-4 space-y-3">
@@ -205,7 +281,7 @@ export default function RuleBuilder({ rules, onChange, onRulesChanged }: RuleBui
         {error && <p className="text-xs text-red-400">{error}</p>}
         {warning && <p className="text-xs text-amber-400">{warning}</p>}
 
-        <div className="flex gap-2">
+        <div className="flex flex-wrap gap-2">
           <button
             type="button"
             onClick={addRule}
@@ -225,6 +301,16 @@ export default function RuleBuilder({ rules, onChange, onRulesChanged }: RuleBui
               Cancel
             </button>
           )}
+          <button
+            type="button"
+            onClick={openSaveTemplateModal}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-zinc-700 hover:bg-zinc-600 text-sm font-medium text-white transition-colors"
+          >
+            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+            </svg>
+            Save as Template
+          </button>
         </div>
       </div>
 
@@ -263,6 +349,84 @@ export default function RuleBuilder({ rules, onChange, onRulesChanged }: RuleBui
             </li>
           ))}
         </ul>
+      )}
+
+      {/* Template Modal */}
+      {showTemplateModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm px-4">
+          <div className="bg-zinc-900 border border-zinc-700 rounded-xl p-6 max-w-lg w-full space-y-4">
+            <h3 className="text-lg font-semibold text-zinc-100">Save Rule Template</h3>
+            <p className="text-sm text-zinc-400">
+              Save the current {rules.length} rule{rules.length !== 1 ? 's' : ''} as a reusable template.
+            </p>
+            <div className="space-y-4">
+              <div>
+                <label htmlFor="template-name" className="block text-sm font-medium text-zinc-300 mb-2">
+                  Template Name
+                </label>
+                <input
+                  id="template-name"
+                  type="text"
+                  value={templateName}
+                  onChange={(e) => setTemplateName(e.target.value)}
+                  placeholder="e.g. High Value Transfers, Admin Functions"
+                  maxLength={50}
+                  className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-lg text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                />
+              </div>
+            </div>
+            <div className="flex gap-3 pt-2">
+              <button
+                onClick={saveAsTemplate}
+                className="flex-1 px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-sm font-medium text-white transition-colors"
+              >
+                Save Template
+              </button>
+              <button
+                onClick={() => setShowTemplateModal(false)}
+                className="flex-1 px-4 py-2 rounded-lg border border-zinc-700 hover:border-zinc-500 text-sm text-zinc-300 hover:text-zinc-100 transition-colors"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Load Template Modal */}
+      {templates.length > 0 && (
+        <div className="bg-zinc-800/50 border border-zinc-700 rounded-lg p-4 space-y-3">
+          <div className="flex items-center justify-between">
+            <h4 className="text-sm font-medium text-zinc-300">Rule Templates ({templates.length})</h4>
+            <button
+              onClick={() => setSelectedTemplateId(templates[0]?.id || null)}
+              className="text-xs text-indigo-400 hover:text-indigo-300"
+            >
+              View All
+            </button>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {templates.slice(0, 3).map((template) => (
+              <button
+                key={template.id}
+                onClick={() => loadTemplate(template.id)}
+                className="flex items-center gap-2 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-lg text-sm text-zinc-300 hover:bg-zinc-700 hover:border-zinc-600 transition-colors"
+              >
+                <span className="font-medium text-zinc-100">{template.name}</span>
+                <span className="text-xs text-zinc-500">{template.rules.length} rule{template.rules.length !== 1 ? 's' : ''}</span>
+                <button
+                  onClick={(e) => { e.stopPropagation(); deleteTemplate(template.id) }}
+                  className="text-zinc-600 hover:text-red-400 ml-1"
+                  aria-label="Delete template"
+                >
+                  <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                  </svg>
+                </button>
+              </button>
+            ))}
+          </div>
+        </div>
       )}
     </div>
   )
