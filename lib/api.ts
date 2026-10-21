@@ -1,4 +1,4 @@
-import { HORIZON_URLS } from '@/lib/stellar'
+import { HORIZON_URLS, isValidUrl } from '@/lib/stellar'
 import type { Network } from '@/types'
 
 const BASE_URL = process.env.NEXT_PUBLIC_API_URL ?? ''
@@ -46,6 +46,10 @@ export async function sendTestWebhook(
   network: Network = 'testnet',
   timeoutMs = 10000
 ): Promise<void> {
+  if (!webhookUrl || !isValidUrl(webhookUrl)) {
+    throw new Error('Invalid webhook URL')
+  }
+
   const payload = {
     label: 'Test Alert',
     contract_id: contractId,

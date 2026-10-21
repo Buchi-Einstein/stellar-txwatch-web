@@ -2,44 +2,151 @@
 
 import RuleBuilder from '@/components/RuleBuilder'
 import FreighterConnect from '@/components/FreighterConnect'
-import { useNewContractForm } from '@/lib/useNewContractForm'
+import Toast from '@/components/Toast'
+
+interface FormErrors {
+  label?: string
+  contract_id?: string
+  webhook_url?: string
+  rules?: string
+  wallet?: string
+  network?: string
+}
 
 export default function NewContractPage() {
-  const {
-    label,
-    setLabel,
-    contractId,
-    setContractId,
-    network,
-    setNetwork,
-    webhookUrl,
-    setWebhookUrl,
-    rules,
-    setRules,
-    errors,
-    setErrors,
-    saving,
-    setSaving,
-    testStatus,
-    setTestStatus,
-    testError,
-    setTestError,
-    testStatusCode,
-    setTestStatusCode,
-    toast,
-    setToast,
-    networkWarning,
-    setNetworkWarning,
-    isConnected,
-    publicKey,
-    handleWalletConnect,
-    validate,
-    isFormValid,
-    isWalletConnected,
-    handleSave,
-    handleTestWebhook,
-    checkNetworkMismatch,
-  } = useNewContractForm()
+  const router = useRouter()
+  const { isConnected, publicKey } = useFreighterConnection()
+  const [networkWarning, setNetworkWarning] = useState<string | null>(null)
+  const [label, setLabel] = useState('')
+  const [contractId, setContractId] = useState('')
+  const [network, setNetwork] = useState<Network>('testnet')
+  const [webhookUrl, setWebhookUrl] = useState('')
+  const [webhookSecret, setWebhookSecret] = useState('')
+  const [showSecret, setShowSecret] = useState(false)
+  const [rules, setRules] = useState<AlertRule[]>([])
+  const [errors, setErrors] = useState<FormErrors>({})
+  const [saving, setSaving] = useState(false)
+  const [testStatus, setTestStatus] = useState<'idle' | 'sending' | 'ok' | 'error'>('idle')
+  const [testError, setTestError] = useState<string | null>(null)
+  const [testStatusCode, setTestStatusCode] = useState<number | null>(null)
+  const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null)
+  const testAbortRef = useRef<AbortController | null>(null)
+
+  useEffect(() => () => testAbortRef.current?.abort(), [])
+
+  function handleWalletConnect() {
+    setErrors((prev) => ({ ...prev, wallet: undefined }))
+  }
+
+  function validate(): FormErrors {
+    const e: FormErrors = {}
+    const trimmedLabel = label.trim()
+    const trimmedContractId = contractId.trim()
+    const trimmedWebhookUrl = webhookUrl.trim()
+
+    if (!trimmedLabel) e.label = 'Label is required'
+    if (!trimmedContractId) e.contract_id = 'Contract ID is required'
+    else if (!isValidContractId(trimmedContractId)) e.contract_id = 'Must be a valid Soroban contract address (starts with C, 56 chars)'
+    else {
+      // Check for duplicate contract_id + network combination
+      const isDuplicate = getContracts().some(
+        (c) => c.contract_id === trimmedContractId && c.network === network
+      )
+      if (isDuplicate) e.contract_id = `This contract is already registered on ${network}`
+    }
+    if (!trimmedWebhookUrl) e.webhook_url = 'Webhook URL is required'
+    else if (!isValidUrl(trimmedWebhookUrl)) e.webhook_url = 'Must be a valid http/https URL'
+    if (rules.length === 0) e.rules = 'Add at least one alert rule'
+    return e
+  }
+
+  async function checkNetworkMismatch(selectedNetwork: Network) {
+    if (!window.freighter) return
+    try {
+      const walletNetwork = await window.freighter?.getNetwork()
+      const networkMap: Record<string, string> = {
+        testnet: 'TESTNET',
+        mainnet: 'PUBLIC',
+        futurenet: 'FUTURENET',
+      }
+      const expectedNetwork = networkMap[selectedNetwork]
+      if (walletNetwork !== expectedNetwork) {
+        setNetworkWarning(
+          `Your wallet is on ${walletNetwork}, but this contract is on ${selectedNetwork.toUpperCase()}`
+        )
+      } else {
+        setNetworkWarning(null)
+      }
+    } catch {
+      setNetworkWarning(null)
+    }
+  }
+
+  async function handleSave() {
+    const e = validate()
+    if (Object.keys(e).length > 0) { setErrors(e); return }
+
+    if (!isConnected) {
+      setErrors({ wallet: 'Connect your Freighter wallet to save contracts' })
+      return
+    }
+
+    setSaving(true)
+    const contract: WatchedContract = {
+      id: crypto.randomUUID(),
+      label: label.trim(),
+      contract_id: contractId.trim(),
+      network,
+      rules,
+      webhook_url: webhookUrl.trim(),
+      webhook_secret: webhookSecret.trim() || undefined,
+      created_at: Date.now(),
+      updated_at: Date.now(),
+    }
+    saveContract(contract)
+    try {
+      sessionStorage.setItem('txwatch_last_created_contract', contract.id)
+    } catch {
+      // ignore storage errors
+    }
+    setToast({ message: `Contract "${contract.label}" saved successfully!`, type: 'success' })
+    setTimeout(() => {
+      router.push(`/contracts/${contract.id}`)
+    }, 1500)
+  }
+
+  async function handleTestWebhook() {
+    const trimmedWebhookUrl = webhookUrl.trim()
+    if (!trimmedWebhookUrl || !isValidUrl(trimmedWebhookUrl)) {
+      setErrors((e) => ({ ...e, webhook_url: 'Enter a valid URL to test' }))
+      return
+    }
+    testAbortRef.current?.abort()
+    const controller = new AbortController()
+    testAbortRef.current = controller
+    const trimmedContractId = contractId.trim()
+    if (!trimmedContractId || !isValidContractId(trimmedContractId)) {
+      setErrors((e) => ({ ...e, contract_id: 'Enter a valid contract ID before testing' }))
+      return
+    }
+    setTestStatus('sending')
+    setTestError(null)
+    setTestStatusCode(null)
+    try {
+      const { status, ok } = await sendTestWebhook(trimmedWebhookUrl, trimmedContractId, network, controller.signal)
+      setTestStatusCode(status)
+      if (ok) {
+        setTestStatus('ok')
+      } else {
+        setTestStatus('error')
+        setTestError(`Server responded with ${status}`)
+      }
+    } catch (err) {
+      if (err instanceof Error && err.name === 'AbortError') return
+      setTestStatus('error')
+      setTestError(err instanceof Error ? err.message : 'Request failed')
+    }
+  }
 
   return (
     <>
@@ -133,6 +240,28 @@ export default function NewContractPage() {
           {testStatus === 'ok' && <p className="mt-1 text-xs text-emerald-400">Test payload delivered — {testStatusCode} received</p>}
         </div>
 
+        {/* Webhook Secret */}
+        <div>
+          <label className="block text-sm font-medium text-zinc-300 mb-1.5">Webhook Secret (Optional)</label>
+          <div className="flex gap-2">
+            <input
+              type={showSecret ? 'text' : 'password'}
+              placeholder="Your HMAC secret key"
+              value={webhookSecret}
+              onChange={(e) => { setWebhookSecret(e.target.value); setErrors((prev) => ({ ...prev, webhook_secret: undefined })) }}
+              className="flex-1 bg-zinc-900 border border-zinc-700 rounded-lg px-3 py-2.5 text-sm text-zinc-100 placeholder-zinc-600 focus:outline-none focus:border-indigo-500 transition-colors"
+            />
+            <button
+              type="button"
+              onClick={() => setShowSecret(!showSecret)}
+              className="px-3 py-2.5 rounded-lg border border-zinc-700 hover:border-zinc-500 text-sm text-zinc-300 hover:text-zinc-100 transition-colors whitespace-nowrap"
+            >
+              {showSecret ? 'Hide' : 'Show'}
+            </button>
+          </div>
+          <p className="mt-1.5 text-xs text-zinc-400">Used to sign payloads with HMAC-SHA256. Receivers can verify the X-TxWatch-Signature header.</p>
+        </div>
+
         {/* Alert Rules */}
         <div>
           <label className="block text-sm font-medium text-zinc-300 mb-1.5">Alert Rules</label>
@@ -157,7 +286,7 @@ export default function NewContractPage() {
           <button
             type="button"
             onClick={handleSave}
-            disabled={saving || !isFormValid()}
+            disabled={saving}
             className="inline-flex items-center gap-2 px-5 py-2.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed text-sm font-medium text-white transition-colors"
           >
             {saving ? 'Saving...' : 'Save Contract'}
