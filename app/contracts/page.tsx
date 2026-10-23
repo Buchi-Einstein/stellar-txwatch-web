@@ -1,18 +1,20 @@
 'use client'
 
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams } from 'next/navigation'
 import Link from 'next/link'
 import { WatchedContract, Network } from '@/types'
-import { getContracts, getAlerts } from '@/lib/storage'
+import { getContracts, getAlerts, removeContract } from '@/lib/storage'
 import ContractCard from '@/components/ContractCard'
 import EmptyState from '@/components/EmptyState'
+import { checkContractExistence } from '@/lib/hooks/useContracts'
 
 type ViewMode = 'flat' | 'grouped'
 type NetworkFilter = 'all' | Network
 type SortOption = 'newest' | 'oldest' | 'label-asc' | 'label-desc'
 
 const PAGE_SIZE = 12
+const UNDO_WINDOW_MS = 8000
 
 const NETWORK_LABELS: Record<Network, string> = {
   mainnet: 'Mainnet',
@@ -34,6 +36,129 @@ const SORT_OPTIONS: { value: SortOption; label: string }[] = [
   { value: 'label-desc', label: 'Label Z–A' },
 ]
 
+const VALID_NETWORKS: Network[] = ['mainnet', 'testnet', 'futurenet']
+
+interface CsvRowError {
+  line: number
+  message: string
+}
+
+interface CsvImportResult {
+  imported: number
+  skipped: number
+  errors: CsvRowError[]
+}
+
+function isValidWebhookUrl(value: string): boolean {
+  if (!value) return true
+  try {
+    const url = new URL(value)
+    return url.protocol === 'http:' || url.protocol === 'https:'
+  } catch {
+    return false
+  }
+}
+
+function parseCsvLine(line: string): string[] {
+  const cells: string[] = []
+  let current = ''
+  let inQuotes = false
+  for (let i = 0; i < line.length; i++) {
+    const char = line[i]
+    if (inQuotes) {
+      if (char === '"') {
+        if (line[i + 1] === '"') {
+          current += '"'
+          i++
+        } else {
+          inQuotes = false
+        }
+      } else {
+        current += char
+      }
+    } else if (char === '"') {
+      inQuotes = true
+    } else if (char === ',') {
+      cells.push(current)
+      current = ''
+    } else {
+      current += char
+    }
+  }
+  cells.push(current)
+  return cells.map((cell) => cell.trim())
+}
+
+function importContractsFromCsv(text: string): CsvImportResult {
+  const errors: CsvRowError[] = []
+  let imported = 0
+  let skipped = 0
+
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+
+  if (lines.length === 0) {
+    return { imported: 0, skipped: 0, errors: [{ line: 0, message: 'CSV file is empty' }] }
+  }
+
+  const header = parseCsvLine(lines[0]).map((cell) => cell.toLowerCase())
+  const expected = ['contract_id', 'label', 'network', 'webhook_url']
+  const hasHeader = expected.every((col) => header.includes(col))
+  const dataLines = hasHeader ? lines.slice(1) : lines
+  const startLine = hasHeader ? 2 : 1
+
+  if (hasHeader) {
+    const missing = expected.filter((col) => !header.includes(col))
+    if (missing.length > 0) {
+      return {
+        imported: 0,
+        skipped: 0,
+        errors: [{ line: 1, message: `Missing column(s): ${missing.join(', ')}` }],
+      }
+    }
+  }
+
+  const colIndex = (name: string) => (hasHeader ? header.indexOf(name) : expected.indexOf(name))
+
+  dataLines.forEach((line, idx) => {
+    const lineNumber = startLine + idx
+    const cells = parseCsvLine(line)
+    const contractId = cells[colIndex('contract_id')] ?? ''
+    const label = cells[colIndex('label')] ?? ''
+    const network = (cells[colIndex('network')] ?? '').toLowerCase()
+    const webhookUrl = cells[colIndex('webhook_url')] ?? ''
+
+    const rowErrors: string[] = []
+    if (!contractId) rowErrors.push('contract_id is required')
+    if (!network) {
+      rowErrors.push('network is required')
+    } else if (!VALID_NETWORKS.includes(network as Network)) {
+      rowErrors.push(`invalid network "${network}"`)
+    }
+    if (!isValidWebhookUrl(webhookUrl)) {
+      rowErrors.push('invalid webhook_url')
+    }
+
+    if (rowErrors.length > 0) {
+      skipped++
+      errors.push({ line: lineNumber, message: rowErrors.join('; ') })
+      return
+    }
+
+    saveContract({
+      contract_id: contractId,
+      label: label || contractId,
+      network: network as Network,
+      webhook_url: webhookUrl || undefined,
+    })
+    imported++
+  })
+
+  return { imported, skipped, errors }
+}
+
 function sortContracts(contracts: WatchedContract[], sortBy: SortOption) {
   const sorted = [...contracts]
   switch (sortBy) {
@@ -51,20 +176,57 @@ function sortContracts(contracts: WatchedContract[], sortBy: SortOption) {
 
 export default function ContractsPage() {
   const searchParams = useSearchParams()
-  const [allContracts, setAllContracts] = useState<WatchedContract[]>([])
+  const { contracts: allContracts, loading } = useContracts()
+  const lastAlertTimes = useLastAlertTimes()
   const [networkFilter, setNetworkFilter] = useState<NetworkFilter>('all')
   const [sortBy, setSortBy] = useState<SortOption>('newest')
   const [search, setSearch] = useState(() => searchParams?.get('q') ?? '')
-  const [mounted, setMounted] = useState(false)
   const [viewMode, setViewMode] = useState<ViewMode>('flat')
   const [page, setPage] = useState(1)
   const [highlightedId, setHighlightedId] = useState<string | null>(null)
+  const [missingIds, setMissingIds] = useState<Set<string>>(new Set())
+
+  // Export / Import state
+  const importInputRef = useRef<HTMLInputElement>(null)
+  const [importError, setImportError] = useState<string | null>(null)
+  const [importSuccess, setImportSuccess] = useState<string | null>(null)
+  const [showImportConfirm, setShowImportConfirm] = useState(false)
+  const [pendingSnapshot, setPendingSnapshot] = useState<ReturnType<typeof parseContractSnapshot> | null>(null)
 
   useEffect(() => {
+    document.title = 'Contracts · TxWatch'
     const all = getContracts()
     setAllContracts(all)
     setMounted(true)
   }, [])
+
+  // Batched existence check for testnet/futurenet contracts (these networks reset periodically)
+  useEffect(() => {
+    if (!mounted) return
+    const candidates = allContracts.filter(
+      (contract) => contract.network === 'testnet' || contract.network === 'futurenet'
+    )
+    if (candidates.length === 0) return
+
+    let cancelled = false
+    checkContractExistence(candidates).then((missing) => {
+      if (cancelled) return
+      setMissingIds(new Set(missing))
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [allContracts, mounted])
+
+  const removeMissing = () => {
+    for (const id of missingIds) {
+      const contract = allContracts.find((c) => c.id === id)
+      if (contract) removeContract(contract.id)
+    }
+    setAllContracts((current) => current.filter((contract) => !missingIds.has(contract.id)))
+    setMissingIds(new Set())
+  }
 
   // Check for a recently-created contract id in sessionStorage and highlight it once
   useEffect(() => {
@@ -84,6 +246,45 @@ export default function ContractsPage() {
   useEffect(() => {
     setPage(1)
   }, [networkFilter, search])
+
+  const refreshContracts = useCallback(() => {
+    setAllContracts(getContracts())
+  }, [])
+
+  const clearUndoTimer = useCallback(() => {
+    if (undoTimerRef.current) {
+      clearTimeout(undoTimerRef.current)
+      undoTimerRef.current = null
+    }
+  }, [])
+
+  useEffect(() => {
+    return () => clearUndoTimer()
+  }, [clearUndoTimer])
+
+  const handleDelete = useCallback(
+    (ids: string[]) => {
+      if (ids.length === 0) return
+      // Commit any previously pending deletion before starting a new one.
+      clearUndoTimer()
+      removeContractDeferred(ids)
+      refreshContracts()
+      setPendingUndo({ ids, count: ids.length })
+      undoTimerRef.current = setTimeout(() => {
+        undoTimerRef.current = null
+        setPendingUndo(null)
+      }, UNDO_WINDOW_MS)
+    },
+    [clearUndoTimer, refreshContracts]
+  )
+
+  const handleUndo = useCallback(() => {
+    if (!pendingUndo) return
+    clearUndoTimer()
+    restoreContracts(pendingUndo.ids)
+    setPendingUndo(null)
+    refreshContracts()
+  }, [clearUndoTimer, pendingUndo, refreshContracts])
 
   const networkFiltered = useMemo(() => {
     if (networkFilter === 'all') {
@@ -129,10 +330,11 @@ export default function ContractsPage() {
     return groups
   }, [sorted])
 
-  if (!mounted) return null
+  if (loading) return null
 
   const hasAnyContracts = allContracts.length > 0
   const hasFilteredContracts = filtered.length > 0
+  const missingCount = missingIds.size
 
   return (
     <div className="space-y-6">
@@ -171,8 +373,53 @@ export default function ContractsPage() {
               Clear search
             </button>
           )}
+
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".csv,text/csv"
+            onChange={handleCsvFile}
+            className="hidden"
+            aria-hidden="true"
+            tabIndex={-1}
+          />
+          <button
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+            className="inline-flex items-center justify-center rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-500"
+          >
+            Import CSV
+          </button>
         </div>
       </div>
+
+      {importResult && (
+        <div className="rounded-lg border border-zinc-800 bg-zinc-900 p-4 text-sm">
+          <div className="flex items-start justify-between gap-3">
+            <p className="font-medium text-zinc-100">
+              {importResult.imported} contracts imported, {importResult.skipped} skipped
+            </p>
+            <button
+              type="button"
+              onClick={() => setImportResult(null)}
+              className="text-zinc-500 hover:text-zinc-300"
+              aria-label="Dismiss import summary"
+            >
+              ✕
+            </button>
+          </div>
+          {importResult.errors.length > 0 && (
+            <ul className="mt-2 space-y-1 text-xs text-red-400">
+              {importResult.errors.map((err, i) => (
+                <li key={i}>
+                  {err.line > 0 ? `Line ${err.line}: ` : ''}
+                  {err.message}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
 
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-wrap items-center gap-1 p-1 bg-zinc-900 border border-zinc-800 rounded-lg w-fit" role="group" aria-label="Filter by network">
@@ -214,9 +461,6 @@ export default function ContractsPage() {
                   </option>
                 ))}
               </select>
-              <svg className="absolute right-2 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-400 pointer-events-none" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-              </svg>
             </div>
           )}
 
@@ -253,57 +497,107 @@ export default function ContractsPage() {
             <span className="hidden sm:inline">Add Contract</span>
             <span className="sm:hidden">Add</span>
           </Link>
+
+          {/* Export / Import */}
+          <input
+            ref={importInputRef}
+            type="file"
+            accept="application/json,.json"
+            className="sr-only"
+            aria-hidden="true"
+            onChange={handleImportFileChange}
+          />
+          {hasAnyContracts && (
+            <button
+              type="button"
+              onClick={handleExport}
+              title="Export all contracts as JSON backup"
+              className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg border border-zinc-700 hover:border-zinc-500 text-sm text-zinc-300 hover:text-zinc-100 transition-colors"
+            >
+              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+              </svg>
+              <span className="hidden sm:inline">Export</span>
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => { setImportError(null); setImportSuccess(null); importInputRef.current?.click() }}
+            title="Import contracts from a JSON backup"
+            className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg border border-zinc-700 hover:border-zinc-500 text-sm text-zinc-300 hover:text-zinc-100 transition-colors"
+          >
+            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l4-4m0 0l4 4m-4-4v12" />
+            </svg>
+            <span className="hidden sm:inline">Import</span>
+          </button>
         </div>
       </div>
+
+      {missingCount > 0 && (
+        <div className="flex flex-col gap-3 rounded-lg border border-amber-700/50 bg-amber-950/40 px-4 py-3 text-sm text-amber-200 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex items-center gap-2">
+            <svg className="w-4 h-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" />
+            </svg>
+            <span>
+              {missingCount} contract{missingCount === 1 ? '' : 's'} not found — network may have been reset
+            </span>
+          </div>
+          <button
+            type="button"
+            onClick={removeMissing}
+            className="inline-flex items-center justify-center rounded-lg bg-amber-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-amber-500"
+          >
+            Remove missing contracts
+          </button>
+        </div>
+      )}
 
       {!hasAnyContracts ? (
         <EmptyState
           title="No contracts yet"
-          description="Register a Soroban contract to begin monitoring transactions and configuring alert rules."
-          action={
-            <Link
-              href="/contracts/new"
-              className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-sm font-medium text-white transition-colors"
-            >
-              Add Contract
-            </Link>
-          }
+          description="Add a contract to start monitoring its activity, or import a CSV to register many at once."
         />
-      ) : !hasFilteredContracts ? (
+      )}
+
+      {hasAnyContracts && !hasFilteredContracts && (
         <EmptyState
-          title="No contracts found"
-          description="No contracts match the active search or network filter. Try clearing the search or selecting a different network."
-          action={
-            <button
-              onClick={() => {
-                setSearch('')
-                setNetworkFilter('all')
-              }}
-              className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-sm font-medium text-white transition-colors"
-            >
-              Clear Filters
-            </button>
-          }
+          title="No matching contracts"
+          description="Try adjusting your search or network filter."
         />
-      ) : viewMode === 'grouped' ? (
+      )}
+
+      {hasFilteredContracts && viewMode === 'flat' && (
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          {paginated.map((contract) => (
+            <ContractCard
+              key={contract.contract_id}
+              contract={contract}
+              highlighted={contract.contract_id === highlightedId}
+            />
+          ))}
+        </div>
+      )}
+
+      {hasFilteredContracts && viewMode === 'grouped' && (
         <div className="space-y-8">
-          {(Object.entries(NETWORK_LABELS) as [Network, string][]).map(([network, label]) => {
-            const networkContracts = grouped[network]
-            if (networkContracts.length === 0) return null
+          {VALID_NETWORKS.map((network) => {
+            const contracts = grouped[network]
+            if (contracts.length === 0) return null
             return (
               <section key={network}>
-                <h2 className="text-lg font-semibold text-zinc-300 mb-3 flex items-center gap-2">
-                  <span className="w-2 h-2 rounded-full bg-zinc-500" />
-                  {label}
-                  <span className="text-sm font-normal text-zinc-500">({networkContracts.length})</span>
+                <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-zinc-400">
+                  {NETWORK_LABELS[network]}
                 </h2>
-                <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
-                  {networkContracts.map((contract) => (
+                <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                  {contracts.map((contract) => (
                     <ContractCard
-                      key={contract.id}
+                      key={contract.contract_id}
                       contract={contract}
-                      lastAlertTime={getAlerts(contract.contract_id)[0]?.timestamp}
+                      lastAlertTime={lastAlertTimes[contract.contract_id]}
                       highlight={highlightedId === contract.id}
+                      missing={missingIds.has(contract.id)}
                     />
                   ))}
                 </div>
@@ -318,36 +612,49 @@ export default function ContractsPage() {
               <ContractCard
                 key={contract.id}
                 contract={contract}
-                lastAlertTime={getAlerts(contract.contract_id)[0]?.timestamp}
+                lastAlertTime={lastAlertTimes[contract.contract_id]}
                 highlight={highlightedId === contract.id}
+                missing={missingIds.has(contract.id)}
               />
             ))}
           </div>
 
-          {totalPages > 1 && (
-            <div className="flex items-center justify-between rounded-lg border border-zinc-800 bg-zinc-900 px-4 py-3 text-sm text-zinc-300">
-              <span>Page {page} of {totalPages}</span>
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  onClick={() => setPage((current) => Math.max(1, current - 1))}
-                  disabled={page === 1}
-                  className="rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm font-medium text-zinc-200 hover:border-zinc-600 disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  Previous
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setPage((current) => Math.min(totalPages, current + 1))}
-                  disabled={page === totalPages}
-                  className="rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm font-medium text-zinc-200 hover:border-zinc-600 disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  Next
-                </button>
-              </div>
-            </div>
-          )}
-        </>
+      {totalPages > 1 && (
+        <div className="flex items-center justify-center gap-2">
+          <button
+            type="button"
+            onClick={() => setPage((p) => Math.max(1, p - 1))}
+            disabled={page === 1}
+            className="rounded-lg bg-zinc-800 px-3 py-1.5 text-sm text-zinc-200 hover:bg-zinc-700 disabled:opacity-40"
+          >
+            Previous
+          </button>
+          <span className="text-sm text-zinc-500">
+            Page {page} of {totalPages}
+          </span>
+          <button
+            type="button"
+            onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+            disabled={page === totalPages}
+            className="rounded-lg bg-zinc-800 px-3 py-1.5 text-sm text-zinc-200 hover:bg-zinc-700 disabled:opacity-40"
+          >
+            Next
+          </button>
+        </div>
+      )}
+
+      {pendingUndo && (
+        <Toast
+          message={
+            pendingUndo.count === 1
+              ? 'Contract deleted'
+              : `${pendingUndo.count} contracts deleted`
+          }
+          actionLabel="Undo"
+          onAction={handleUndo}
+          onDismiss={() => setPendingUndo(null)}
+          duration={UNDO_WINDOW_MS}
+        />
       )}
     </div>
   )
