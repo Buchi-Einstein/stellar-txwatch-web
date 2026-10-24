@@ -4,7 +4,8 @@ import { AlertRule, Network, WatchedContract } from '@/types'
 import { isValidContractId, isValidUrl } from '@/lib/stellar'
 import { saveContract, getContracts } from '@/lib/storage'
 import { sendTestWebhook } from '@/lib/api'
-import { useFreighterConnection } from '@/lib/useFreighterConnection'
+import { STORAGE_KEYS } from '@/lib/storageKeys'
+import { useFreighterConnection } from '@/hooks/useFreighterConnection'
 
 interface FormErrors {
   label?: string
@@ -134,7 +135,7 @@ export function useNewContractForm() {
     }
     saveContract(contract)
     try {
-      sessionStorage.setItem('txwatch_last_created_contract', contract.id)
+      sessionStorage.setItem(STORAGE_KEYS.LAST_CREATED_CONTRACT, contract.id)
     } catch {
       // ignore storage errors
     }

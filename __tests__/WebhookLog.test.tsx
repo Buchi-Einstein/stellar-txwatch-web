@@ -69,4 +69,18 @@ describe('WebhookLog', () => {
     const copyBtn = screen.getByTitle('Copy to clipboard')
     expect(copyBtn).toBeInTheDocument()
   })
+
+  it('aligns alerts on sharedTimestamps and renders placeholder rows for missing timestamps', () => {
+    const t1 = new Date('2024-01-15T12:05:00Z').getTime()
+    const t2 = new Date('2024-01-15T12:00:00Z').getTime()
+    render(
+      <WebhookLog
+        alerts={[{ ...baseAlert, timestamp: t2 }]}
+        network="testnet"
+        sharedTimestamps={[t1, t2]}
+      />
+    )
+    expect(screen.getByText(/No alert at this timestamp/i)).toBeInTheDocument()
+    expect(screen.getByText('large_transfer')).toBeInTheDocument()
+  })
 })
